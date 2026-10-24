@@ -1,0 +1,287 @@
+#!/usr/bin/env bash
+# supersapi — a swarm of sapis. Extremely dependable, relentlessly resourceful.
+# https://github.com/sapiensmalti/supersapi
+#
+# Starts the sapid broker on the host and a root agent in the current
+# directory. The agent can spawn children; the broker makes sure every child
+# gets less than its parent, never more. The Docker socket is never mounted.
+set -Eeuo pipefail
+
+readonly SUPERSAPI_VERSION="0.1.0"
+readonly REPO="${SUPERSAPI_REPO:-sapiensmalti/supersapi}"
+readonly HOME_DIR="${SUPERSAPI_HOME:-$HOME/.local/share/supersapi}"
+readonly STATE_ROOT="${SUPERSAPI_STATE:-$HOME/.local/state/supersapi}"
+readonly CONFIG_VOLUME="${SAPI_CONFIG_VOLUME:-sapi-config}"
+readonly IMAGE_REPOSITORY="supersapi"
+
+die() { printf 'supersapi: %s\n' "$*" >&2; exit 1; }
+log() { printf 'supersapi: %s\n' "$*" >&2; }
+
+usage() {
+    cat <<EOF
+supersapi $SUPERSAPI_VERSION — a swarm of sapis, scoped to this directory.
+
+Usage:
+  supersapi              Start an interactive root agent that can spawn children
+  supersapi run TASK     Headless: run one agent on TASK, print its final message, exit
+  supersapi ps           Show the swarm tree for this directory
+  supersapi logs ID      Print a node's log (JSONL)
+  supersapi stop ID      Stop a node and its subtree
+  supersapi doctor       Verify Docker, the image, and broker connectivity from a container
+  supersapi build        Build the image without starting
+  supersapi upgrade      Upgrade supersapi
+  supersapi version | help
+
+Isolation (ceilings for the whole swarm; children can only go lower):
+  SUPERSAPI_ACCESS        read-write (default) | read-only | none
+  SUPERSAPI_NETWORK       full (default) | none
+  SUPERSAPI_TIMEOUT       per-child seconds (default 3600)
+  SUPERSAPI_CPUS          per-child CPUs (default 2)
+  SUPERSAPI_MEMORY_MIB    per-child MiB (default 4096)
+  SUPERSAPI_MAX_CHILDREN  running children per node (default 4)
+  SUPERSAPI_MAX_DEPTH     tree depth (default 2)
+  SUPERSAPI_MAX_TOTAL     running nodes in the swarm (default 16)
+
+Other:
+  SAPI_MODEL              model for the root agent (children: per task, or pi decides)
+  SAPI_ENV                host variables to pass to the root, e.g. "ANTHROPIC_API_KEY"
+  SAPI_CONFIG_VOLUME      pi credentials volume (default sapi-config, shared with sapi)
+  SUPERSAPI_TRANSPORT     unix (default) | tcp — tcp is auto-selected on Docker Desktop
+  SUPERSAPI_PI_VERSION    pi version baked into the image (default latest)
+  SUPERSAPI_REBUILD=1     rebuild the image from scratch
+
+Docs: https://github.com/$REPO
+EOF
+}
+
+sha256() {
+    if command -v sha256sum >/dev/null 2>&1; then sha256sum | awk '{print $1}'
+    elif command -v shasum >/dev/null 2>&1; then shasum -a 256 | awk '{print $1}'
+    else die "need sha256sum or shasum"; fi
+}
+
+require_docker() {
+    command -v docker >/dev/null 2>&1 || die "docker not found. See https://github.com/$REPO#install"
+    if ! docker info >/dev/null 2>&1 && [[ "$OS" == "Darwin" ]] && command -v open >/dev/null 2>&1; then
+        log "Docker is not running; trying to start OrbStack or Docker Desktop ..."
+        open -gj -a OrbStack >/dev/null 2>&1 || open -gj -a Docker >/dev/null 2>&1 || true
+        for _ in $(seq 1 30); do docker info >/dev/null 2>&1 && break; sleep 1; done
+    fi
+    docker info >/dev/null 2>&1 || die "Docker is not running or you lack permission."
+}
+
+require_install() {
+    [[ -x "$SAPID" ]] || die "sapid not found at $SAPID (reinstall: see https://github.com/$REPO#install)"
+    [[ -f "$HOME_DIR/image/Dockerfile" && -f "$HOME_DIR/extension/index.ts" ]] \
+        || die "image sources missing under $HOME_DIR (reinstall)"
+}
+
+# ---------------------------------------------------------------------------
+# Context
+# ---------------------------------------------------------------------------
+OS="$(uname -s)"
+WORKSPACE="$(pwd -P)"
+SAPID="${SUPERSAPI_SAPID:-$(dirname -- "$(command -v "$0" 2>/dev/null || printf '%s' "$0")")/sapid}"
+[[ -x "$SAPID" ]] || SAPID="$HOME/.local/bin/sapid"
+SWARM_ID="$(printf '%s' "$WORKSPACE" | sha256 | cut -c1-8)"
+STATE_DIR="$STATE_ROOT/$SWARM_ID"
+if [[ "$OS" == "Linux" ]]; then UID_="$(id -u)"; GID_="$(id -g)"; else UID_=0; GID_=0; fi
+readonly OS WORKSPACE SWARM_ID STATE_DIR UID_ GID_
+
+image_tag() {
+    local digest
+    digest="$( (cat "$HOME_DIR/image/Dockerfile"; cat "$HOME_DIR"/extension/*.ts; printf '%s' "${SUPERSAPI_PI_VERSION:-latest}") | sha256 | cut -c1-12)"
+    printf '%s:%s' "$IMAGE_REPOSITORY" "$digest"
+}
+
+cmd_build() {
+    require_docker; require_install
+    IMAGE="$(image_tag)"
+    if [[ "${SUPERSAPI_REBUILD:-0}" == 1 ]] || ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
+        local opts=(--tag "$IMAGE" --build-arg "PI_VERSION=${SUPERSAPI_PI_VERSION:-latest}")
+        [[ "${SUPERSAPI_REBUILD:-0}" == 1 ]] && opts+=(--no-cache --pull)
+        log "building $IMAGE ..."
+        DOCKER_BUILDKIT=1 docker build "${opts[@]}" -f "$HOME_DIR/image/Dockerfile" "$HOME_DIR"
+    fi
+}
+
+# Decide how containers reach the broker. Unix sockets cannot be bind-mounted
+# through Docker Desktop's VM; everything else handles them fine.
+transport() {
+    case "${SUPERSAPI_TRANSPORT:-auto}" in
+        unix|tcp) printf '%s' "$SUPERSAPI_TRANSPORT"; return ;;
+    esac
+    if docker info --format '{{.OperatingSystem}}' 2>/dev/null | grep -qi 'docker desktop'; then
+        printf 'tcp'
+    else
+        printf 'unix'
+    fi
+}
+
+sapid_running() {
+    [[ -f "$STATE_DIR/sapid.json" ]] || return 1
+    local pid; pid="$(jq -r .pid "$STATE_DIR/sapid.json" 2>/dev/null || true)"
+    [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null
+}
+
+# Start the broker for this directory in the background; sets SAPID_ADDR_HOST.
+start_sapid() {
+    sapid_running && die "a swarm is already running for $WORKSPACE (pid $(jq -r .pid "$STATE_DIR/sapid.json")). Use 'supersapi ps' or stop it first."
+    mkdir -p "$STATE_DIR"
+    local args=(serve --state-dir "$STATE_DIR" --root-dir "$WORKSPACE" --image "$IMAGE"
+        --config-volume "$CONFIG_VOLUME" --exit-with-pid "$$"
+        --access "${SUPERSAPI_ACCESS:-read-write}" --network "${SUPERSAPI_NETWORK:-full}"
+        --timeout-secs "${SUPERSAPI_TIMEOUT:-3600}" --cpus "${SUPERSAPI_CPUS:-2}" --memory-mib "${SUPERSAPI_MEMORY_MIB:-4096}"
+        --max-children "${SUPERSAPI_MAX_CHILDREN:-4}" --max-depth "${SUPERSAPI_MAX_DEPTH:-2}" --max-total "${SUPERSAPI_MAX_TOTAL:-16}")
+    [[ "$OS" == "Linux" ]] && args+=(--uid "$UID_" --gid "$GID_")
+    local t; t="$(transport)"
+    if [[ "$t" == tcp ]]; then
+        if [[ "$OS" == "Linux" ]]; then
+            local gw; gw="$(docker network inspect bridge --format '{{(index .IPAM.Config 0).Gateway}}' 2>/dev/null || true)"
+            args+=(--listen "tcp:${gw:-172.17.0.1}:0" --add-host-gateway)
+        else
+            args+=(--listen "tcp:127.0.0.1:0")
+        fi
+    fi
+    "$SAPID" "${args[@]}" 2>>"$STATE_DIR/sapid.log" &
+    SAPID_PID=$!
+    for _ in $(seq 1 100); do [[ -f "$STATE_DIR/token" && -f "$STATE_DIR/sapid.json" ]] && break; sleep 0.05; done
+    [[ -f "$STATE_DIR/token" ]] || { tail -n 5 "$STATE_DIR/sapid.log" >&2; die "sapid failed to start (see $STATE_DIR/sapid.log)"; }
+    SAPID_ADDR_HOST="$(jq -r .addr "$STATE_DIR/sapid.json")"
+    SAPID_ADDR_CONTAINER="$(jq -r .addr_in_container "$STATE_DIR/sapid.json")"
+    log "broker pid $SAPID_PID · $SAPID_ADDR_HOST · logs $STATE_DIR"
+}
+
+stop_sapid() {
+    if [[ -n "${SAPID_PID:-}" ]] && kill -0 "$SAPID_PID" 2>/dev/null; then
+        kill -TERM "$SAPID_PID" 2>/dev/null || true
+        for _ in $(seq 1 100); do kill -0 "$SAPID_PID" 2>/dev/null || break; sleep 0.1; done
+    fi
+}
+
+ctl() {
+    sapid_running || die "no swarm is running for $WORKSPACE"
+    "$SAPID" ctl --addr "$(jq -r .addr "$STATE_DIR/sapid.json")" --token-file "$STATE_DIR/token" "$@"
+}
+
+# docker run arguments shared by the root container and doctor.
+root_container_args() {
+    local -a a=(--rm --init --hostname sapi --workdir /workspace
+        --label sh.supersapi.managed=true --label "sh.supersapi.swarm=$SWARM_ID" --label sh.supersapi.node=000
+        --mount "type=volume,source=$CONFIG_VOLUME,target=/pi-config"
+        --env PI_CODING_AGENT_DIR=/pi-config --env GIT_CONFIG_GLOBAL=/pi-config/gitconfig
+        --env "SAPID_ADDR=$SAPID_ADDR_CONTAINER" --env SAPID_TOKEN --env SAPID_NODE=000 --env SAPID_DEPTH=0
+        --security-opt no-new-privileges --cap-drop ALL
+        --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add DAC_READ_SEARCH --cap-add FOWNER
+        --cap-add SETUID --cap-add SETGID --cap-add SETPCAP)
+    [[ "$OS" == "Linux" ]] && a+=(--env "SAPI_UID=$UID_" --env "SAPI_GID=$GID_")
+    case "$SAPID_ADDR_CONTAINER" in
+        unix://*) a+=(--volume "$STATE_DIR/sapid.sock:/run/sapid/sapid.sock") ;;
+        tcp://*)  [[ "$OS" == "Linux" ]] && a+=(--add-host host.docker.internal:host-gateway) ;;
+    esac
+    case "${SUPERSAPI_ACCESS:-read-write}" in
+        read-write) a+=(--volume "$WORKSPACE:/workspace") ;;
+        read-only)  a+=(--volume "$WORKSPACE:/workspace:ro") ;;
+        none)       a+=(--volume /workspace) ;;
+    esac
+    [[ "${SUPERSAPI_NETWORK:-full}" == none ]] && a+=(--network none)
+    printf '%s\n' "${a[@]}"
+}
+
+cmd_start() {
+    [[ -t 0 && -t 1 ]] || die "an interactive terminal is required (use 'supersapi run TASK' for headless)"
+    cmd_build
+    start_sapid
+    trap 'stop_sapid' EXIT
+    local sessions="supersapi-${SWARM_ID}-sessions"
+    docker volume create "$sessions" >/dev/null
+    docker volume create "$CONFIG_VOLUME" >/dev/null
+
+    local -a args=() env_args=() var
+    while IFS= read -r line; do args+=("$line"); done < <(root_container_args)
+    for var in ${SAPI_ENV:-}; do
+        [[ "$var" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || die "SAPI_ENV: invalid variable name '$var'"
+        env_args+=(--env "$var")
+    done
+    local -a pi_args=(--continue --extension /opt/supersapi/extension/index.ts)
+    [[ -n "${SAPI_MODEL:-}" ]] && pi_args+=(--model "$SAPI_MODEL")
+
+    printf '\n  swarm      %s\n  workspace  %s\n  access     %s · network %s\n  limits     %s children/node · depth %s · %s total\n  state      %s\n  detach     Ctrl-P, Ctrl-Q (the swarm keeps running until this shell exits)\n\n' \
+        "$SWARM_ID" "$WORKSPACE" "${SUPERSAPI_ACCESS:-read-write}" "${SUPERSAPI_NETWORK:-full}" \
+        "${SUPERSAPI_MAX_CHILDREN:-4}" "${SUPERSAPI_MAX_DEPTH:-2}" "${SUPERSAPI_MAX_TOTAL:-16}" "$STATE_DIR" >&2
+
+    docker rm -f "ssapi-${SWARM_ID}-000" >/dev/null 2>&1 || true
+    SAPID_TOKEN="$(cat "$STATE_DIR/token")" docker run --interactive --tty \
+        --name "ssapi-${SWARM_ID}-000" \
+        --mount "type=volume,source=$sessions,target=/pi-sessions" \
+        --env PI_CODING_AGENT_SESSION_DIR=/pi-sessions --env SAPI_AUTO_UPDATE="${SAPI_AUTO_UPDATE:-1}" \
+        "${args[@]}" ${env_args[@]+"${env_args[@]}"} \
+        "$IMAGE" "${pi_args[@]}" || true
+}
+
+cmd_run() {
+    [[ -n "${1:-}" ]] || die "usage: supersapi run TASK"
+    cmd_build
+    start_sapid
+    trap 'stop_sapid' EXIT
+    local -a extra=()
+    [[ -n "${SAPI_MODEL:-}" ]] && extra+=(--model "$SAPI_MODEL")
+    # Spawn one child of the root and wait; print only its final message.
+    "$SAPID" ctl --addr "$SAPID_ADDR_HOST" --token-file "$STATE_DIR/token" \
+        spawn --wait ${extra[@]+"${extra[@]}"} "$1" \
+        | jq -r 'if type == "object" and has("output") then .output else empty end'
+}
+
+cmd_doctor() {
+    require_docker; require_install
+    local ok=0 bad=0
+    pass() { ok=$((ok + 1)); printf '  ok    %s\n' "$*"; }
+    fail() { bad=$((bad + 1)); printf '  FAIL  %s\n' "$*"; }
+    printf 'supersapi %s · sapid %s\n' "$SUPERSAPI_VERSION" "$("$SAPID" --version 2>/dev/null | awk '{print $2}')"
+    docker info --format 'docker {{.ServerVersion}} on {{.OperatingSystem}} ({{.OSType}}/{{.Architecture}})' 2>/dev/null
+    printf 'transport %s\n' "$(transport)"
+    cmd_build >/dev/null 2>&1 && pass "image $IMAGE" || fail "image build"
+    docker run --rm --entrypoint /bin/sh "$IMAGE" -c 'test -f /opt/supersapi/extension/index.ts' && pass "extension in image" || fail "extension missing from image"
+    # Connectivity: start a broker on a temp state dir and connect from inside a container.
+    local save_state="$STATE_DIR"; STATE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/supersapi-doctor.XXXXXX")"
+    if start_sapid 2>/dev/null; then
+        local -a args=(); while IFS= read -r line; do args+=("$line"); done < <(root_container_args)
+        local out
+        out="$(SAPID_TOKEN="$(cat "$STATE_DIR/token")" docker run "${args[@]}" --entrypoint /bin/bash "$IMAGE" -c '
+            node -e "
+              const net=require(\"net\");const a=process.env.SAPID_ADDR;
+              const s=a.startsWith(\"unix://\")?net.connect(a.slice(7)):net.connect(+a.split(\":\").pop(),a.slice(6).split(\":\")[0]);
+              s.setTimeout(5000,()=>{console.log(\"timeout\");process.exit(2)});
+              s.on(\"connect\",()=>s.write(JSON.stringify({id:\"1\",token:process.env.SAPID_TOKEN,op:\"hello\"})+\"\\n\"));
+              s.on(\"data\",d=>{console.log(d.toString().trim());process.exit(0)});
+              s.on(\"error\",e=>{console.log(\"error \"+e.message);process.exit(1)});"' 2>&1 || true)"
+        if printf '%s' "$out" | grep -q '"ok":true'; then pass "container → broker → hello ($SAPID_ADDR_CONTAINER)"
+        else fail "container cannot reach the broker via $SAPID_ADDR_CONTAINER: $out"; printf '        try: SUPERSAPI_TRANSPORT=tcp supersapi doctor\n'; fi
+        stop_sapid
+    else
+        fail "broker failed to start (see $STATE_DIR/sapid.log)"
+    fi
+    rm -rf "$STATE_DIR"; STATE_DIR="$save_state"
+    printf '\n%d ok, %d failed\n' "$ok" "$bad"
+    [[ "$bad" -eq 0 ]]
+}
+
+cmd_upgrade() {
+    command -v curl >/dev/null 2>&1 || die "curl is required"
+    curl -fsSL --proto '=https' --tlsv1.2 "https://raw.githubusercontent.com/$REPO/main/install.sh" \
+        | SUPERSAPI_INSTALL_DIR="$(dirname -- "$SAPID")" SUPERSAPI_HOME="$HOME_DIR" bash
+}
+
+case "${1:-}" in
+    ""|-c|--continue) cmd_start ;;
+    run)        shift; cmd_run "$*" ;;
+    ps)         ctl tree ;;
+    logs)       [[ -n "${2:-}" ]] || die "usage: supersapi logs ID"; ctl logs "$2" ;;
+    stop)       [[ -n "${2:-}" ]] || die "usage: supersapi stop ID"; ctl stop "$2" ;;
+    doctor)     cmd_doctor ;;
+    build)      cmd_build ;;
+    upgrade)    cmd_upgrade ;;
+    version|-V|--version) printf '%s\n' "$SUPERSAPI_VERSION" ;;
+    help|-h|--help) usage ;;
+    *)          die "unknown command: $1 (see supersapi help)" ;;
+esac
