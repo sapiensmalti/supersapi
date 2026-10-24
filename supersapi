@@ -86,7 +86,7 @@ SAPID="${SUPERSAPI_SAPID:-$(dirname -- "$(command -v "$0" 2>/dev/null || printf 
 SWARM_ID="$(printf '%s' "$WORKSPACE" | sha256 | cut -c1-8)"
 STATE_DIR="$STATE_ROOT/$SWARM_ID"
 if [[ "$OS" == "Linux" ]]; then UID_="$(id -u)"; GID_="$(id -g)"; else UID_=0; GID_=0; fi
-readonly OS WORKSPACE SWARM_ID STATE_DIR UID_ GID_
+readonly OS WORKSPACE SWARM_ID UID_ GID_
 
 image_tag() {
     local digest
