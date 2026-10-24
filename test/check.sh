@@ -44,7 +44,7 @@ check "package"  scripts/package.sh test-target "$SAPID" "$assets"
 check "install from assets" env SUPERSAPI_ASSET_DIR="$assets" SUPERSAPI_INSTALL_DIR="$bin" SUPERSAPI_HOME="$home" \
     bash -c 'sed -e "s/^target=.*/target=test-target/" -e "s/^asset=.*/asset=supersapi-test-target.tar.gz/" install.sh | bash'
 check "installed files" test -x "$bin/supersapi" -a -x "$bin/sapid" -a -f "$home/image/Dockerfile" -a -f "$home/extension/index.ts"
-sed -i.bak 's/^[0-9a-f]/0/' "$assets/SHA256SUMS"
+sed -i.bak 's/^./x/' "$assets/SHA256SUMS"   # 'x' is never a hex digit
 check "tampered checksum refused" bash -c "! SUPERSAPI_ASSET_DIR=$assets SUPERSAPI_INSTALL_DIR=$(mktemp -d) bash -c 'sed -e \"s/^target=.*/target=test-target/\" -e \"s/^asset=.*/asset=supersapi-test-target.tar.gz/\" install.sh | bash'"
 
 echo "launcher (docker shim)"
