@@ -65,6 +65,11 @@ out="$(cd "$proj" && PATH="$shim:$PATH" FAKE_DOCKER_STATE="$fake" SAPID_BIN="$bi
     timeout 60 "$bin/supersapi" run "echo:launcher works" 2>/dev/null || true)"
 [[ "$out" == "launcher works" ]] && ok "supersapi run (headless) prints the child's output" || bad "supersapi run: got '$out'"
 pgrep -x sapid >/dev/null && bad "broker left running" || ok "broker exits with the launcher"
+set +e
+(cd "$proj" && PATH="$shim:$PATH" FAKE_DOCKER_STATE="$fake" SAPID_BIN="$bin/sapid" SUPERSAPI_HOME="$home" SUPERSAPI_STATE="$state" \
+    timeout 60 "$bin/supersapi" run "fail" >/dev/null 2>&1); code=$?
+set -e
+[[ "$code" -eq 3 ]] && ok "supersapi run propagates the child's exit code (3)" || bad "run exit code: $code"
 out="$(cd "$proj" && SUPERSAPI_STATE="$state" "$bin/supersapi" ps 2>&1 || true)"
 [[ "$out" == *"no swarm is running"* ]] && ok "ps without a swarm" || bad "ps: $out"
 

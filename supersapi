@@ -226,10 +226,17 @@ cmd_run() {
     trap 'stop_sapid' EXIT
     local -a extra=()
     [[ -n "${SAPI_MODEL:-}" ]] && extra+=(--model "$SAPI_MODEL")
-    # Spawn one child of the root and wait; print only its final message.
-    "$SAPID" ctl --addr "$SAPID_ADDR_HOST" --token-file "$STATE_DIR/token" \
-        spawn --wait ${extra[@]+"${extra[@]}"} "$1" \
-        | jq -r 'if type == "object" and has("output") then .output else empty end'
+    # Spawn one child of the root and wait. Final message on stdout; progress on
+    # stderr; exit code = the child's (1 if it was stopped or failed to start).
+    local out
+    out="$("$SAPID" ctl --addr "$SAPID_ADDR_HOST" --token-file "$STATE_DIR/token" \
+        spawn --wait ${extra[@]+"${extra[@]}"} "$1")" || die "broker request failed"
+    printf '%s\n' "$out" | jq -r 'select(type == "object" and has("output")) | .output'
+    local state code
+    state="$(printf '%s\n' "$out" | jq -r 'select(type == "object" and has("node")) | .node.state')"
+    code="$(printf '%s\n' "$out" | jq -r 'select(type == "object" and has("node")) | .node.exit_code // 1')"
+    [[ "$state" == exited ]] || { log "child $state"; return 1; }
+    return "$code"
 }
 
 cmd_doctor() {
