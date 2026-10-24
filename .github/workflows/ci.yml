@@ -57,7 +57,7 @@ jobs:
         include:
           - { os: ubuntu-latest,       target: x86_64-unknown-linux-musl }
           - { os: ubuntu-24.04-arm,    target: aarch64-unknown-linux-musl }
-          - { os: macos-13,            target: x86_64-apple-darwin }
+          - { os: macos-latest,        target: x86_64-apple-darwin }   # cross-linked on arm64; Intel runners are retired
           - { os: macos-latest,        target: aarch64-apple-darwin }
     runs-on: ${{ matrix.os }}
     steps:
@@ -70,4 +70,7 @@ jobs:
           workspaces: sapid
           key: ${{ matrix.target }}
       - run: cd sapid && cargo build --release --locked --target ${{ matrix.target }}
-      - run: sapid/target/${{ matrix.target }}/release/sapid --version
+      - if: matrix.target != 'x86_64-apple-darwin'
+        run: sapid/target/${{ matrix.target }}/release/sapid --version
+      - if: matrix.target == 'x86_64-apple-darwin'
+        run: file sapid/target/${{ matrix.target }}/release/sapid | grep -q x86_64
