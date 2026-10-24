@@ -451,11 +451,12 @@ async fn ctl(a: CtlArgs) -> Result<()> {
     };
     let addr = Addr::parse(&a.addr)?;
     let mut c = Client::connect(&addr, token).await?;
-    let print_event = |e: &serde_json::Value| {
+    // Events are printed as JSON lines so output stays machine-readable;
+    // `logs` prints the raw log lines (which are JSON already).
+    let print_event = |e: &serde_json::Value| println!("{e}");
+    let print_line = |e: &serde_json::Value| {
         if let Some(line) = e.get("line").and_then(serde_json::Value::as_str) {
             println!("{line}");
-        } else {
-            println!("{e}");
         }
     };
 
@@ -531,7 +532,7 @@ async fn ctl(a: CtlArgs) -> Result<()> {
             .await?
         }
         CtlOp::Logs { id, follow } => {
-            c.call(Op::Logs(LogsParams { id, follow }), print_event)
+            c.call(Op::Logs(LogsParams { id, follow }), print_line)
                 .await?
         }
         CtlOp::Stop { id } => c.call(Op::Stop(NodeRef { id }), print_event).await?,
